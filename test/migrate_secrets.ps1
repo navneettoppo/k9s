@@ -8,10 +8,16 @@
     - Idempotent: skips any item where the destination was updated more
       recently than the source (timestamp comparison).
     - Never deletes anything in source or destination.
-    - Secret values are not readable via the GitHub API; those items are
-      flagged in the report for manual entry.
+    - Secret values are resolved from Azure Key Vault when -KeyVaultName is
+      supplied; otherwise flagged in the report for manual entry.
     - Produces a timestamped CSV audit report and a matching log file.
     - Auto-installs gh CLI via winget if missing.
+
+.PARAMETER KeyVaultName
+    Azure Key Vault name to resolve secret values from (e.g. "my-keyvault").
+    The secret name in Key Vault must match the GitHub secret name (case-insensitive).
+    Requires: az CLI authenticated with access to the vault.
+    If omitted, secrets are flagged for manual entry.
 
 .PARAMETER SourceOrg
     Source GitHub organisation name.
@@ -36,7 +42,12 @@
 
 .EXAMPLE
     .\migrate_secrets.ps1 -SourceOrg "source-org" -DestOrg "dest-org" `
-        -Repos @("repo-one","repo-two") -Environments @("production","staging")
+        -KeyVaultName "my-keyvault"
+
+.EXAMPLE
+    .\migrate_secrets.ps1 -SourceOrg "source-org" -DestOrg "dest-org" `
+        -KeyVaultName "my-keyvault" `
+        -Repos @("repo-one","repo-two") -Environments @("production","staging") -DryRun
 #>
 
 [CmdletBinding()]
@@ -49,6 +60,10 @@ param(
 
     [string[]] $Repos        = @(),
     [string[]] $Environments = @(),
+
+    # Azure Key Vault name to resolve secret values from (e.g. "my-keyvault")
+    # If omitted, secrets are flagged for manual entry as before.
+    [string] $KeyVaultName   = "",
 
     [switch] $DryRun
 )
@@ -130,6 +145,21 @@ function Get-SecretTs($meta) {
     return ""
 }
 
+# ── Key Vault secret resolution ───────────────────────────────────────────────
+# Returns the plaintext secret value from Key Vault, or $null if not found.
+# Key Vault secret names are case-insensitive and allow letters, numbers, hyphens.
+# GitHub secret names use underscores — we normalise by replacing _ with -.
+function Get-KvSecret([string]$secretName) {
+    if ([string]::IsNullOrWhiteSpace($KeyVaultName)) { return $null }
+    $kvName = $secretName.ToLower().Replace("_", "-")
+    $value  = az keyvault secret show --vault-name $KeyVaultName --name $kvName --query "value" -o tsv 2>$null
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($value)) {
+        Write-Warn "  Key Vault: secret '$kvName' not found in '$KeyVaultName'"
+        return $null
+    }
+    return $value
+}
+
 # ==============================================================================
 # PRE-FLIGHT
 # ==============================================================================
@@ -168,7 +198,24 @@ function Invoke-PreflightChecks {
     }
     Write-Success "GitHub CLI: authenticated"
 
-    # Verify both orgs are reachable before making any changes
+    # Verify Key Vault access if supplied
+    if (-not [string]::IsNullOrWhiteSpace($KeyVaultName)) {
+        if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
+            Write-Err "Azure CLI (az) is required when -KeyVaultName is specified. Install: https://aka.ms/installazurecliwindows"
+            exit 1
+        }
+        az account show 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Err "Azure CLI not authenticated. Run: az login"
+            exit 1
+        }
+        $kvCheck = az keyvault show --name $KeyVaultName --query "name" -o tsv 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Err "Cannot access Key Vault '$KeyVaultName': $kvCheck"
+            exit 1
+        }
+        Write-Success "Azure Key Vault: $KeyVaultName (accessible)"
+    }
     foreach ($org in @($SourceOrg, $DestOrg)) {
         $result = gh api "orgs/$org" --jq '.login' 2>&1
         if ($LASTEXITCODE -ne 0) {
@@ -201,17 +248,27 @@ function Invoke-OrgSecrets {
             continue
         }
 
-        $action = "manual_required"
-        $notes  = "Secret value not readable via API — set manually in $DestOrg"
-        if ($DryRun) { $action = "dry_run"; $notes = "[DRY RUN] would flag for manual migration" }
-
-        Write-Warn "ORG SECRET [$name] — flagged for manual migration (value unreadable via API)"
-        Add-CsvRow "org" "" "" "secret" $name $srcTs $dstTs $action "flagged" $notes
-    }
-}
-
-# ==============================================================================
-# ORG-LEVEL VARIABLES
+        $secretValue = Get-KvSecret $name
+        if ($null -eq $secretValue) {
+            $action = if ($DryRun) { "dry_run" } else { "manual_required" }
+            $notes  = if ($DryRun) { "[DRY RUN] would flag for manual migration" } else { "Not found in Key Vault '$KeyVaultName' — set manually in $DestOrg" }
+            Write-Warn "ORG SECRET [$name] — flagged for manual migration"
+            Add-CsvRow "org" "" "" "secret" $name $srcTs $dstTs $action "flagged" $notes
+            continue
+        }
+        if ($DryRun) {
+            Write-Info "ORG SECRET [$name] [DRY RUN] would migrate from Key Vault"
+            Add-CsvRow "org" "" "" "secret" $name $srcTs $dstTs "dry_run" "would_migrate" "value from Key Vault"
+            continue
+        }
+        gh secret set $name --org $DestOrg --body $secretValue | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Success "ORG SECRET [$name] migrated from Key Vault"
+            Add-CsvRow "org" "" "" "secret" $name $srcTs $dstTs "migrated" "success" "value from Key Vault"
+        } else {
+            Write-Err "ORG SECRET [$name] — failed to set in $DestOrg"
+            Add-CsvRow "org" "" "" "secret" $name $srcTs $dstTs "migrate" "failed" "API error"
+        }
 # ==============================================================================
 function Invoke-OrgVariables {
     Write-Step "Org variables: $SourceOrg → $DestOrg"
@@ -277,8 +334,27 @@ function Invoke-RepoSecrets([string]$repo) {
             continue
         }
 
-        Write-Warn "REPO SECRET [$repo/$name] — flagged for manual migration (value unreadable via API)"
-        Add-CsvRow "repo" $repo "" "secret" $name $srcTs $dstTs "manual_required" "flagged" "Secret value not readable via API"
+        $secretValue = Get-KvSecret $name
+        if ($null -eq $secretValue) {
+            $action = if ($DryRun) { "dry_run" } else { "manual_required" }
+            $notes  = if ($DryRun) { "[DRY RUN] would flag for manual migration" } else { "Not found in Key Vault '$KeyVaultName' — set manually" }
+            Write-Warn "REPO SECRET [$repo/$name] — flagged for manual migration"
+            Add-CsvRow "repo" $repo "" "secret" $name $srcTs $dstTs $action "flagged" $notes
+            continue
+        }
+        if ($DryRun) {
+            Write-Info "REPO SECRET [$repo/$name] [DRY RUN] would migrate from Key Vault"
+            Add-CsvRow "repo" $repo "" "secret" $name $srcTs $dstTs "dry_run" "would_migrate" "value from Key Vault"
+            continue
+        }
+        gh secret set $name --repo "$DestOrg/$repo" --body $secretValue | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Success "REPO SECRET [$repo/$name] migrated from Key Vault"
+            Add-CsvRow "repo" $repo "" "secret" $name $srcTs $dstTs "migrated" "success" "value from Key Vault"
+        } else {
+            Write-Err "REPO SECRET [$repo/$name] — failed to set"
+            Add-CsvRow "repo" $repo "" "secret" $name $srcTs $dstTs "migrate" "failed" "API error"
+        }
     }
 }
 
@@ -353,8 +429,27 @@ function Invoke-EnvSecrets([string]$repo, [string]$env) {
             continue
         }
 
-        Write-Warn "ENV SECRET [$repo/$env/$name] — flagged for manual migration (value unreadable via API)"
-        Add-CsvRow "environment" $repo $env "secret" $name $srcTs $dstTs "manual_required" "flagged" "Secret value not readable via API"
+        $secretValue = Get-KvSecret $name
+        if ($null -eq $secretValue) {
+            $action = if ($DryRun) { "dry_run" } else { "manual_required" }
+            $notes  = if ($DryRun) { "[DRY RUN] would flag for manual migration" } else { "Not found in Key Vault '$KeyVaultName' — set manually" }
+            Write-Warn "ENV SECRET [$repo/$env/$name] — flagged for manual migration"
+            Add-CsvRow "environment" $repo $env "secret" $name $srcTs $dstTs $action "flagged" $notes
+            continue
+        }
+        if ($DryRun) {
+            Write-Info "ENV SECRET [$repo/$env/$name] [DRY RUN] would migrate from Key Vault"
+            Add-CsvRow "environment" $repo $env "secret" $name $srcTs $dstTs "dry_run" "would_migrate" "value from Key Vault"
+            continue
+        }
+        gh secret set $name --repo "$DestOrg/$repo" --env $env --body $secretValue | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Success "ENV SECRET [$repo/$env/$name] migrated from Key Vault"
+            Add-CsvRow "environment" $repo $env "secret" $name $srcTs $dstTs "migrated" "success" "value from Key Vault"
+        } else {
+            Write-Err "ENV SECRET [$repo/$env/$name] — failed to set"
+            Add-CsvRow "environment" $repo $env "secret" $name $srcTs $dstTs "migrate" "failed" "API error"
+        }
     }
 }
 
@@ -434,13 +529,19 @@ Write-Host "╚═════════════════════�
 Write-Host ""
 Write-Host "    Source org : $SourceOrg"
 Write-Host "    Dest org   : $DestOrg"
+Write-Host "    Key Vault  : $(if ($KeyVaultName) { $KeyVaultName } else { '(none — secrets flagged for manual entry)' })"
 Write-Host "    Dry run    : $($DryRun.IsPresent)"
 Write-Host "    Report     : $ReportFile"
 Write-Host "    Log        : $LogFile"
 Write-Host ""
 
-Initialize-Report
+# ── Pre-flight FIRST — abort before touching anything if any check fails ──────
 Invoke-PreflightChecks
+Write-Host ""
+Write-Host "  ✔ All pre-flight checks passed — starting migration" -ForegroundColor Green
+Write-Host ""
+
+Initialize-Report
 
 # ── Org level ─────────────────────────────────────────────────────────────────
 Write-Step "Org-level migration"

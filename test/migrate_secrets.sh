@@ -20,6 +20,12 @@
 # .PARAMETER DEST_ORG
 #     Destination GitHub organisation name.
 #
+# .PARAMETER KEY_VAULT_NAME
+#     Azure Key Vault name to resolve secret values from (e.g. "my-keyvault").
+#     The secret name in Key Vault must match the GitHub secret name (case-insensitive,
+#     underscores replaced with hyphens). Requires az CLI authenticated.
+#     If empty, secrets are flagged for manual entry.
+#
 # .PARAMETER REPOS
 #     Space-separated list of repo names to migrate.
 #     Leave empty to auto-discover all repos in SOURCE_ORG.
@@ -32,13 +38,13 @@
 #     Set to "true" to preview all actions without writing anything.
 #
 # .EXAMPLE
-#     ./migrate_secrets.sh
+#     KEY_VAULT_NAME=my-keyvault ./migrate_secrets.sh
 #
 # .EXAMPLE
-#     DRY_RUN=true ./migrate_secrets.sh
+#     DRY_RUN=true KEY_VAULT_NAME=my-keyvault ./migrate_secrets.sh
 #
 # .REQUIREMENTS
-#     gh CLI (auto-installed if missing), jq, python3
+#     gh CLI (auto-installed if missing), jq, python3, az CLI (if KEY_VAULT_NAME set)
 # ==============================================================================
 
 set -euo pipefail
@@ -49,6 +55,9 @@ IFS=$'\n\t'
 # ==============================================================================
 SOURCE_ORG="${SOURCE_ORG:-source-org-name}"
 DEST_ORG="${DEST_ORG:-dest-org-name}"
+
+# Azure Key Vault name — leave empty to flag secrets for manual entry instead
+KEY_VAULT_NAME="${KEY_VAULT_NAME:-}"
 
 # Repos to migrate — leave empty to auto-discover all repos in SOURCE_ORG
 REPOS=()
@@ -110,6 +119,20 @@ get_secret_meta() {
     || echo '{"updated_at":null,"created_at":null}'
 }
 
+# ── Key Vault secret resolution ───────────────────────────────────────────────
+# Returns the plaintext value or empty string if not found / KV not configured.
+get_kv_secret() {
+  local name="$1"
+  [[ -z "$KEY_VAULT_NAME" ]] && echo "" && return
+  # GitHub uses UPPER_SNAKE; Key Vault names are lowercase-hyphen
+  local kv_name
+  kv_name=$(echo "$name" | tr '[:upper:]_' '[:lower:]-')
+  local value
+  value=$(az keyvault secret show --vault-name "$KEY_VAULT_NAME" --name "$kv_name" \
+            --query "value" -o tsv 2>/dev/null || true)
+  echo "$value"
+}
+
 
 # ==============================================================================
 # PRE-FLIGHT: auto-install prerequisites (mirrors PS1 pre-flight pattern)
@@ -164,6 +187,15 @@ check_prereqs() {
   fi
   Write-Success "GitHub CLI: authenticated"
 
+  # Verify Key Vault access if configured
+  if [[ -n "$KEY_VAULT_NAME" ]]; then
+    command -v az &>/dev/null || { Write-Error "az CLI required when KEY_VAULT_NAME is set. Install: https://aka.ms/installazureclilinux"; exit 1; }
+    az account show &>/dev/null || { Write-Error "Azure CLI not authenticated. Run: az login"; exit 1; }
+    az keyvault show --name "$KEY_VAULT_NAME" --query "name" -o tsv &>/dev/null \
+      || { Write-Error "Cannot access Key Vault '$KEY_VAULT_NAME'. Check name and permissions."; exit 1; }
+    Write-Success "Azure Key Vault: $KEY_VAULT_NAME (accessible)"
+  fi
+
   # Verify both orgs are reachable before making any changes
   for org in "$SOURCE_ORG" "$DEST_ORG"; do
     local result
@@ -199,12 +231,32 @@ migrate_org_secrets() {
       continue
     fi
 
-    # GitHub API never exposes secret values — flag for manual entry
-    local action="manual_required" notes="Secret value not readable via API — set manually in $DEST_ORG"
-    [[ "$DRY_RUN" == "true" ]] && { action="dry_run"; notes="[DRY RUN] would flag for manual migration"; }
+    # GitHub API never exposes secret values — try Key Vault, else flag for manual entry
+    local secret_value
+    secret_value=$(get_kv_secret "$name")
 
-    Write-Warn "ORG SECRET [$name] — flagged for manual migration (value unreadable via API)"
-    csv_row "org" "" "" "secret" "$name" "$src_ts" "$dst_ts" "$action" "flagged" "$notes"
+    if [[ -z "$secret_value" ]]; then
+      local action notes
+      action="manual_required"; notes="Not found in Key Vault '${KEY_VAULT_NAME:-none}' — set manually in $DEST_ORG"
+      [[ "$DRY_RUN" == "true" ]] && { action="dry_run"; notes="[DRY RUN] would flag for manual migration"; }
+      Write-Warn "ORG SECRET [$name] — flagged for manual migration"
+      csv_row "org" "" "" "secret" "$name" "$src_ts" "$dst_ts" "$action" "flagged" "$notes"
+      continue
+    fi
+
+    [[ "$DRY_RUN" == "true" ]] && {
+      Write-Info "ORG SECRET [$name] [DRY RUN] would migrate from Key Vault"
+      csv_row "org" "" "" "secret" "$name" "$src_ts" "$dst_ts" "dry_run" "would_migrate" "value from Key Vault"
+      continue
+    }
+
+    if gh secret set "$name" --org "$DEST_ORG" --body "$secret_value" &>/dev/null; then
+      Write-Success "ORG SECRET [$name] migrated from Key Vault"
+      csv_row "org" "" "" "secret" "$name" "$src_ts" "$dst_ts" "migrated" "success" "value from Key Vault"
+    else
+      Write-Error "ORG SECRET [$name] — failed to set in $DEST_ORG"
+      csv_row "org" "" "" "secret" "$name" "$src_ts" "$dst_ts" "migrate" "failed" "API error"
+    fi
   done <<< "$(echo "$secrets" | jq -c '.')"
 }
 
@@ -280,8 +332,30 @@ migrate_repo_secrets() {
       continue
     fi
 
-    Write-Warn "REPO SECRET [$repo/$name] — flagged for manual migration (value unreadable via API)"
-    csv_row "repo" "$repo" "" "secret" "$name" "$src_ts" "$dst_ts" "manual_required" "flagged" "Secret value not readable via API"
+    local secret_value
+    secret_value=$(get_kv_secret "$name")
+
+    if [[ -z "$secret_value" ]]; then
+      Write-Warn "REPO SECRET [$repo/$name] — flagged for manual migration"
+      local notes="Not found in Key Vault '${KEY_VAULT_NAME:-none}' — set manually"
+      [[ "$DRY_RUN" == "true" ]] && notes="[DRY RUN] would flag for manual migration"
+      csv_row "repo" "$repo" "" "secret" "$name" "$src_ts" "$dst_ts" "manual_required" "flagged" "$notes"
+      continue
+    fi
+
+    [[ "$DRY_RUN" == "true" ]] && {
+      Write-Info "REPO SECRET [$repo/$name] [DRY RUN] would migrate from Key Vault"
+      csv_row "repo" "$repo" "" "secret" "$name" "$src_ts" "$dst_ts" "dry_run" "would_migrate" "value from Key Vault"
+      continue
+    }
+
+    if gh secret set "$name" --repo "$DEST_ORG/$repo" --body "$secret_value" &>/dev/null; then
+      Write-Success "REPO SECRET [$repo/$name] migrated from Key Vault"
+      csv_row "repo" "$repo" "" "secret" "$name" "$src_ts" "$dst_ts" "migrated" "success" "value from Key Vault"
+    else
+      Write-Error "REPO SECRET [$repo/$name] — failed to set"
+      csv_row "repo" "$repo" "" "secret" "$name" "$src_ts" "$dst_ts" "migrate" "failed" "API error"
+    fi
   done <<< "$(echo "$secrets" | jq -c '.')"
 }
 
@@ -363,8 +437,30 @@ migrate_env_secrets() {
       continue
     fi
 
-    Write-Warn "ENV SECRET [$repo/$env/$name] — flagged for manual migration (value unreadable via API)"
-    csv_row "environment" "$repo" "$env" "secret" "$name" "$src_ts" "$dst_ts" "manual_required" "flagged" "Secret value not readable via API"
+    local secret_value
+    secret_value=$(get_kv_secret "$name")
+
+    if [[ -z "$secret_value" ]]; then
+      Write-Warn "ENV SECRET [$repo/$env/$name] — flagged for manual migration"
+      local notes="Not found in Key Vault '${KEY_VAULT_NAME:-none}' — set manually"
+      [[ "$DRY_RUN" == "true" ]] && notes="[DRY RUN] would flag for manual migration"
+      csv_row "environment" "$repo" "$env" "secret" "$name" "$src_ts" "$dst_ts" "manual_required" "flagged" "$notes"
+      continue
+    fi
+
+    [[ "$DRY_RUN" == "true" ]] && {
+      Write-Info "ENV SECRET [$repo/$env/$name] [DRY RUN] would migrate from Key Vault"
+      csv_row "environment" "$repo" "$env" "secret" "$name" "$src_ts" "$dst_ts" "dry_run" "would_migrate" "value from Key Vault"
+      continue
+    }
+
+    if gh secret set "$name" --repo "$DEST_ORG/$repo" --env "$env" --body "$secret_value" &>/dev/null; then
+      Write-Success "ENV SECRET [$repo/$env/$name] migrated from Key Vault"
+      csv_row "environment" "$repo" "$env" "secret" "$name" "$src_ts" "$dst_ts" "migrated" "success" "value from Key Vault"
+    else
+      Write-Error "ENV SECRET [$repo/$env/$name] — failed to set"
+      csv_row "environment" "$repo" "$env" "secret" "$name" "$src_ts" "$dst_ts" "migrate" "failed" "API error"
+    fi
   done <<< "$(echo "$secrets" | jq -c '.')"
 }
 
@@ -452,12 +548,18 @@ main() {
   echo -e "${RESET}"
   echo "    Source org : $SOURCE_ORG"
   echo "    Dest org   : $DEST_ORG"
+  echo "    Key Vault  : ${KEY_VAULT_NAME:-(none — secrets flagged for manual entry)}"
   echo "    Dry run    : $DRY_RUN"
   echo "    Report     : $REPORT_FILE"
   echo "    Log        : $LOG_FILE"
 
-  _csv_header
+  # ── Pre-flight FIRST — abort before touching anything if any check fails ───
   check_prereqs
+  echo ""
+  echo -e "${GREEN}${BOLD}✔ All pre-flight checks passed — starting migration${RESET}"
+  echo ""
+
+  _csv_header
 
   # ── Org level ──────────────────────────────────────────────────────────────
   Write-Step "Org-level migration"
